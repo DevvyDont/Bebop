@@ -1,0 +1,30 @@
+[project]
+name = "bebop-bot"
+version = "0.1.0"
+description = "A Discord Bot for managing Deadlock PUGs."
+license = "MIT"
+requires-python = ">=3.11"
+
+[tool.poetry]
+packages = [{ include = "bot" }]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+"discord.py" = "^2.6"
+aiohttp = "^3.11"
+motor = "^3.7"
+pydantic-settings = "^2.8"
+
+[tool.poetry.group.dev.dependencies]
+ruff = "^0.11"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "TCH", "RUF"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

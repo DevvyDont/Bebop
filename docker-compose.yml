@@ -1,0 +1,23 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      mongo:
+        condition: service_healthy
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: mongosh --eval "db.runCommand('ping').ok" --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  mongo-data:
