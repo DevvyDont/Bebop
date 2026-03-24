@@ -339,6 +339,8 @@ class DeadlockCallbackServer:
 
         settings_payload_text = raw_body.decode("utf-8", errors="replace")
         compact_summary = self._build_settings_update_summary(settings_payload_text)
+        if not compact_summary:
+            return web.Response(status=200, text="ok")
         attachment = self._build_settings_payload_attachment(context.match_number, settings_payload_text)
         message = (
             f"⚙️ **Match {context.match_number}** settings were updated. "
@@ -353,6 +355,7 @@ class DeadlockCallbackServer:
 
     @staticmethod
     def _build_settings_update_summary(settings_payload_text: str) -> str:
+        return  # temp
         if not settings_payload_text.strip():
             return "Summary: empty payload."
 

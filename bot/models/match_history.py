@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from typing import TYPE_CHECKING
 
 from pydantic import BaseModel
@@ -15,3 +16,5 @@ class MatchHistoryRecord(BaseModel):
     hidden_king_player_ids: tuple[int, ...]
     archmother_player_ids: tuple[int, ...]
 
+
+MatchHistoryRecord.model_rebuild(_types_namespace={"datetime": dt.datetime})

@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     # Queue settings
-    queue_size: int = 4  # Deadlock games are 12 players, so this should always be 12 unless you are testing something.
+    queue_size: int = 12  # Deadlock games are 12 players, so this should always be 12 unless you are testing something.
     queue_channel_id: int | None = None
     commands_channel_id: int | None = None
     admin_role_name: str = "PUG Manager"

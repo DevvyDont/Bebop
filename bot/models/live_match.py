@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
@@ -35,3 +36,6 @@ class LiveMatchPostRecord(BaseModel):
     last_refresh_requested_by_user_id: int | None = None
     last_heartbeat_at: datetime | None = None
     cleanup_completed_at: datetime | None = None
+
+
+LiveMatchPostRecord.model_rebuild(_types_namespace={"datetime": dt.datetime})
