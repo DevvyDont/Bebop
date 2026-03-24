@@ -727,6 +727,7 @@ class QueueCog(commands.Cog, name="Queue"):
 
         removed_match = self._forget_active_match(guild_id, match_channels.match_number)
         self._pop_draft_session(guild_id, match_channels.match_number)
+        self._pop_hero_selection_session(guild_id, match_channels.match_number)
         if removed_match is not None and removed_match.deadlock_party_id is not None:
             await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
 
@@ -831,6 +832,7 @@ class QueueCog(commands.Cog, name="Queue"):
 
         removed_match = self._forget_active_match(guild_id, match.match_number)
         self._pop_draft_session(guild_id, match.match_number)
+        self._pop_hero_selection_session(guild_id, match.match_number)
         if removed_match is not None and removed_match.deadlock_party_id is not None:
             await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
 
@@ -852,6 +854,7 @@ class QueueCog(commands.Cog, name="Queue"):
                 await self.bot.deadlock_callbacks.discard_pending_callback(active_match.callback_token)
 
         self._draft_sessions_by_guild.pop(guild_id, None)
+        self._hero_selection_sessions_by_guild.pop(guild_id, None)
 
         self._next_match_number_by_guild.pop(guild_id, None)
         return deleted_channel_count
@@ -862,6 +865,55 @@ class QueueCog(commands.Cog, name="Queue"):
             return 0
 
         return await self._delete_discovered_match_channels(guild_id, discovered_match_channels)
+
+    async def _get_waiting_room_voice_channel(self, guild_id: int) -> discord.VoiceChannel | None:
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return None
+
+        category = _find_category(guild, PUGS_CATEGORY_NAME)
+        if category is None:
+            return None
+
+        return _find_voice_channel(category, WAITING_ROOM_CHANNEL_NAME)
+
+    async def _move_match_members_to_waiting_room(self, guild_id: int, match_channels: MatchChannels) -> None:
+        waiting_room = await self._get_waiting_room_voice_channel(guild_id)
+        if waiting_room is None:
+            return
+
+        members_to_move: dict[int, discord.Member] = {}
+        for voice_channel in (match_channels.team_a_voice_channel, match_channels.team_b_voice_channel):
+            if voice_channel is None:
+                continue
+            for member in voice_channel.members:
+                members_to_move[member.id] = member
+
+        for member in members_to_move.values():
+            try:
+                await member.move_to(waiting_room, reason="Move player back to waiting room after match completion")
+            except discord.Forbidden:
+                log.warning("Missing permission to move member %s to waiting room in guild %s", member.id, guild_id)
+            except discord.HTTPException:
+                log.exception("Failed to move member %s to waiting room in guild %s", member.id, guild_id)
+
+    async def handle_match_finished(self, guild_id: int, match_number: int) -> bool:
+        discovered_match_channels = self._discover_match_channels(guild_id).get(match_number)
+        if discovered_match_channels is None:
+            # Channels may already be gone; still release active match/callback tracking if present.
+            removed_match = self._forget_active_match(guild_id, match_number)
+            self._pop_draft_session(guild_id, match_number)
+            self._pop_hero_selection_session(guild_id, match_number)
+
+            if removed_match is not None and removed_match.deadlock_party_id is not None:
+                await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
+            if removed_match is not None and removed_match.callback_token is not None:
+                await self.bot.deadlock_callbacks.discard_pending_callback(removed_match.callback_token)
+            return True
+
+        await self._move_match_members_to_waiting_room(guild_id, discovered_match_channels)
+        deleted_channel_count = await self._delete_discovered_match_channels(guild_id, discovered_match_channels)
+        return deleted_channel_count > 0
 
     async def _create_match_text_channel(
         self,

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hmac
 import io
 import json
 import logging
+import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -36,6 +38,8 @@ TEAM_ARCHMOTHER_LABEL = "Archmother"
 LIVELOCK_MATCH_URL_TEMPLATE = "https://livelock.gg/matches/{match_id}"
 UNASSIGNED_HERO_LABEL = "Unassigned"
 LIVE_MATCH_REFRESH_COOLDOWN_SECONDS = 300
+LIVE_MATCH_HEARTBEAT_INTERVAL_SECONDS = 60
+LIVE_MATCH_HEARTBEAT_JITTER_SECONDS = 15
 TEAM_INDEX_HIDDEN_KING = 0
 TEAM_INDEX_ARCHMOTHER = 1
 MAX_SETTINGS_SUMMARY_KEYS = 6
@@ -89,6 +93,7 @@ class DeadlockCallbackServer:
         self._app = web.Application()
         self._runner: web.AppRunner | None = None
         self._site: web.TCPSite | None = None
+        self._live_match_heartbeat_task: asyncio.Task[None] | None = None
 
         callback_base_path = self._path_prefix
         self._app.router.add_post(f"{callback_base_path}/{{token}}", self._handle_match_started_callback)
@@ -116,9 +121,16 @@ class DeadlockCallbackServer:
         await self._runner.setup()
         self._site = web.TCPSite(self._runner, host=self._bind_host, port=self._bind_port)
         await self._site.start()
+        self._start_live_match_heartbeat()
         log.info("Deadlock callback server listening on %s:%s", self._bind_host, self._bind_port)
 
     async def close(self) -> None:
+        if self._live_match_heartbeat_task is not None:
+            self._live_match_heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._live_match_heartbeat_task
+            self._live_match_heartbeat_task = None
+
         if self._runner is not None:
             await self._runner.cleanup()
         self._runner = None
@@ -195,6 +207,89 @@ class DeadlockCallbackServer:
             if token is None:
                 return
             self._active_by_token.pop(token, None)
+
+    def _start_live_match_heartbeat(self) -> None:
+        if self._live_match_heartbeat_task is not None and not self._live_match_heartbeat_task.done():
+            return
+        self._live_match_heartbeat_task = asyncio.create_task(self._run_live_match_heartbeat())
+
+    async def _run_live_match_heartbeat(self) -> None:
+        while True:
+            try:
+                await self._heartbeat_live_matches_once()
+            except Exception:
+                log.exception("Live match heartbeat iteration failed unexpectedly.")
+
+            heartbeat_delay_seconds = LIVE_MATCH_HEARTBEAT_INTERVAL_SECONDS + random.uniform(
+                0,
+                LIVE_MATCH_HEARTBEAT_JITTER_SECONDS,
+            )
+            await asyncio.sleep(heartbeat_delay_seconds)
+
+    async def _heartbeat_live_matches_once(self) -> None:
+        in_progress_records = await self._get_in_progress_live_match_posts()
+        if not in_progress_records:
+            return
+
+        heartbeat_timestamp = datetime.now(UTC)
+        for live_match_record in in_progress_records:
+            await self._heartbeat_single_live_match(live_match_record, heartbeat_timestamp)
+
+    async def _heartbeat_single_live_match(
+        self,
+        live_match_record: LiveMatchPostRecord,
+        heartbeat_timestamp: datetime,
+    ) -> None:
+        try:
+            latest_metadata = await self._bot.deadlock_api.get_match_metadata(live_match_record.match_id)
+        except DeadlockApiRequestError as error:
+            log.warning(
+                "Heartbeat metadata refresh failed for match_id=%s (status=%s)",
+                live_match_record.match_id,
+                error.status_code,
+            )
+            return
+
+        updated_record = self._apply_match_metadata_to_record(live_match_record, latest_metadata, heartbeat_timestamp)
+        await self._upsert_live_match_post_record(updated_record)
+        await self._sync_live_match_post_message(updated_record)
+
+        if updated_record.status == LiveMatchPostStatus.FINISHED and updated_record.cleanup_completed_at is None:
+            await self._handle_match_completion_cleanup(updated_record)
+
+    async def _get_in_progress_live_match_posts(self) -> tuple[LiveMatchPostRecord, ...]:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return ()
+
+        raw_records = await collection.find({"status": LiveMatchPostStatus.IN_PROGRESS.value}).to_list(length=None)
+        parsed_records: list[LiveMatchPostRecord] = []
+        for raw_record in raw_records:
+            if not isinstance(raw_record, dict):
+                continue
+            parsed_records.append(LiveMatchPostRecord.model_validate(raw_record))
+        return tuple(parsed_records)
+
+    async def _handle_match_completion_cleanup(self, record: LiveMatchPostRecord) -> None:
+        queue_cog = self._bot.get_cog("Queue")
+        if queue_cog is None or not hasattr(queue_cog, "handle_match_finished"):
+            log.warning(
+                "Queue cleanup hook is unavailable; cannot auto-clean finished match %s.",
+                record.match_number,
+            )
+            return
+
+        cleanup_succeeded = await queue_cog.handle_match_finished(record.guild_id, record.match_number)
+        if not cleanup_succeeded:
+            log.warning(
+                "Queue cleanup did not confirm completion for guild=%s match=%s.",
+                record.guild_id,
+                record.match_number,
+            )
+            return
+
+        updated_record = record.model_copy(update={"cleanup_completed_at": datetime.now(UTC)})
+        await self._upsert_live_match_post_record(updated_record)
 
     def _build_callback_url(self, token: str) -> str:
         if self._public_base_url is None:
@@ -456,6 +551,8 @@ class DeadlockCallbackServer:
             last_refresh_requested_by_user_id=(
                 existing_record.last_refresh_requested_by_user_id if existing_record is not None else None
             ),
+            last_heartbeat_at=existing_record.last_heartbeat_at if existing_record is not None else None,
+            cleanup_completed_at=existing_record.cleanup_completed_at if existing_record is not None else None,
         )
         await self._upsert_live_match_post_record(live_match_record)
         await self._sync_live_match_post_message(live_match_record)
@@ -583,6 +680,12 @@ class DeadlockCallbackServer:
         await self._upsert_live_match_post_record(updated_record)
         await self._sync_live_match_post_message(updated_record)
 
+        if updated_record.status == LiveMatchPostStatus.FINISHED and updated_record.cleanup_completed_at is None:
+            await self._handle_match_completion_cleanup(updated_record)
+            persisted_record = await self._get_live_match_post_by_match_id(updated_record.match_id)
+            if persisted_record is not None:
+                updated_record = persisted_record
+
         refresh_message = "🔄 Match data refreshed."
         if updated_record.status == LiveMatchPostStatus.FINISHED and updated_record.winning_team_label is not None:
             refresh_message = f"🏆 Match finished — {updated_record.winning_team_label} won."
@@ -672,6 +775,7 @@ class DeadlockCallbackServer:
                 "winning_team_label": winning_team_label or record.winning_team_label,
                 "duration_seconds": duration_seconds,
                 "last_refresh_at": refreshed_at,
+                "last_heartbeat_at": refreshed_at,
             }
         )
 

@@ -33,3 +33,5 @@ class LiveMatchPostRecord(BaseModel):
     duration_seconds: int | None = None
     last_refresh_at: datetime | None = None
     last_refresh_requested_by_user_id: int | None = None
+    last_heartbeat_at: datetime | None = None
+    cleanup_completed_at: datetime | None = None
