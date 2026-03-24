@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from pymongo.errors import PyMongoError
 
 log = logging.getLogger(__name__)
 
@@ -19,10 +20,11 @@ class Database:
 
         try:
             await client.admin.command("ping")
-        except Exception:
+        except PyMongoError as error:
             log.exception("Failed to connect to MongoDB")
             client.close()
-            return
+            msg = "Failed to connect to MongoDB"
+            raise RuntimeError(msg) from error
 
         self.client = client
         self.db = client[self._db_name]
@@ -31,4 +33,6 @@ class Database:
     async def close(self) -> None:
         if self.client:
             self.client.close()
+            self.client = None
+            self.db = None
             log.info("Closed MongoDB connection")

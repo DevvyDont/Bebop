@@ -94,8 +94,8 @@ Define the data model and service boundaries before implementing gameplay featur
 
 - [ ] Create core domain models in `bot/models/`.
   - [ ] `PlayerProfile`
-  - [ ] `QueueEntry`
-  - [ ] `QueueSnapshot`
+  - [x] `QueueEntry`
+  - [x] `QueueSnapshot`
   - [ ] `DraftSession`
   - [ ] `DraftVote`
   - [ ] `TeamAssignment`
@@ -104,12 +104,12 @@ Define the data model and service boundaries before implementing gameplay featur
   - [ ] `MatchResult`
 - [ ] Create repository and service layers in `bot/services/`.
   - [ ] Player repository
-  - [ ] Queue repository/service
+  - [x] Queue repository/service
   - [ ] Draft service
   - [ ] Match service
   - [ ] Stats service
 - [ ] Define enums and constants for all finite game concepts.
-  - [ ] queue states
+  - [x] queue states
   - [ ] draft phases
   - [ ] vote options
   - [ ] match statuses
@@ -119,7 +119,7 @@ Define the data model and service boundaries before implementing gameplay featur
   - [ ] queue channel IDs
   - [ ] log channel IDs
   - [ ] match size / team size
-- [ ] Add MongoDB indexes once the initial models are chosen.
+- [~] Add MongoDB indexes once the initial models are chosen.
 
 ## Phase 2 — Queue MVP
 
@@ -309,7 +309,7 @@ Keep the project maintainable as features expand.
 
 ## Suggested Build Order
 
-1. [ ] Complete Phase 0 research and document what the Deadlock API can actually do.
+1. [x] Complete Phase 0 research and document what the Deadlock API can actually do.
 2. [ ] Implement Phase 1 models, enums, and repositories.
 3. [ ] Build the Queue MVP from Phase 2.
 4. [ ] Add Draft System support from Phase 3.
@@ -322,7 +322,7 @@ Keep the project maintainable as features expand.
 - [x] Create `DEADLOCK_API_RESEARCH.md` with full Deadlock API endpoint inventory. ✅
 - [ ] Obtain a Deadlock API key for custom match creation (required before Phase 4). Add to `.env` as `DEADLOCK_API_KEY`.
 - [ ] Decide the first supported match format and queue size for the community (answers open questions above).
-- [ ] Design the first set of models in `bot/models/` (Phase 1).
+- [~] Design the first set of models in `bot/models/` (Phase 1) — queue models implemented.
 - [ ] Design the first queue commands and queue-state persistence rules (Phase 2).
 
 ## Open Questions
