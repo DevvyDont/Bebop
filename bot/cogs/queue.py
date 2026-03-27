@@ -19,6 +19,7 @@ from bot.models.deadlock import DeadlockCustomMatchCreateRequest
 from bot.models.match_history import MatchHistoryRecord
 from bot.models.queue import QueueState
 from bot.services.deadlock_api import DeadlockApiConfigurationError, DeadlockApiRequestError
+from bot.services.deadlock_callback_server import LiveMatchTrackStatus, MatchIdRemapStatus
 from bot.services.hero_roster import list_playable_heroes, resolve_hero_alias
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ REMAKE_READY_MESSAGE = "Remake approved. Recreating the custom lobby now."
 MATCH_HISTORY_COLLECTION_NAME = "match_history"
 DEFAULT_MATCH_HISTORY_LIMIT = 10
 MAX_MATCH_HISTORY_LIMIT = 20
+MIN_MATCH_ID = 1
 OPENING_TURN_PICK_COUNT = 1
 STANDARD_TURN_PICK_COUNT = 2
 MIN_HERO_PICK_COUNT = 3
@@ -2564,6 +2566,162 @@ class QueueCog(commands.Cog, name="Queue"):
 
         await interaction.response.send_message(
             f"🧹 Cancelled match `{match_number}` and deleted {deleted_channel_count} channel(s).",
+            ephemeral=True,
+        )
+
+    @queue_group.command(name="remap", description="[Admin] Remap a tracked match ID to a new match ID.")
+    @app_commands.check(_admin_check)
+    async def queue_remap(
+        self,
+        interaction: discord.Interaction[BebopBot],
+        old_match_id: int,
+        new_match_id: int,
+    ) -> None:
+        if interaction.guild_id is None:
+            return
+
+        if old_match_id < MIN_MATCH_ID or new_match_id < MIN_MATCH_ID:
+            await interaction.response.send_message(
+                f"❌ Match IDs must be integers greater than or equal to `{MIN_MATCH_ID}`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        remap_summary = await self.bot.deadlock_callbacks.remap_tracked_match_id(
+            interaction.guild_id,
+            old_match_id,
+            new_match_id,
+        )
+
+        status = remap_summary.status
+        if status == MatchIdRemapStatus.SUCCESS:
+            await interaction.followup.send(
+                (
+                    f"✅ Remapped match ID `{old_match_id}` -> `{new_match_id}`.\n"
+                    f"• Updated live match post record(s): **{remap_summary.updated_live_match_post_count}**\n"
+                    f"• Updated match history record(s): **{remap_summary.updated_match_history_count}**\n"
+                    f"• Live match post synced: **{'yes' if remap_summary.synced_live_match_post else 'no'}**"
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if status == MatchIdRemapStatus.OLD_MATCH_NOT_FOUND:
+            await interaction.followup.send(
+                f"❌ No tracked records were found for old match ID `{old_match_id}` in this server.",
+                ephemeral=True,
+            )
+            return
+
+        if status == MatchIdRemapStatus.NEW_MATCH_ALREADY_TRACKED:
+            await interaction.followup.send(
+                f"❌ Match ID `{new_match_id}` is already tracked in this server. Choose a different new match ID.",
+                ephemeral=True,
+            )
+            return
+
+        if status == MatchIdRemapStatus.DATABASE_UNAVAILABLE:
+            await interaction.followup.send(
+                "❌ Remap failed because the database connection is unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        if status == MatchIdRemapStatus.INVALID_INPUT:
+            await interaction.followup.send(
+                "❌ Remap failed because the supplied IDs were invalid. Use two different positive integers.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "❌ Remap failed due to a database write error. Check logs and try again.",
+            ephemeral=True,
+        )
+
+    @queue_group.command(name="track", description="[Admin] Re-enable heartbeat tracking for an existing match ID.")
+    @app_commands.check(_admin_check)
+    async def queue_track(self, interaction: discord.Interaction[BebopBot], match_id: int) -> None:
+        if interaction.guild_id is None:
+            return
+
+        if match_id < MIN_MATCH_ID:
+            await interaction.response.send_message(
+                f"❌ Match ID must be an integer greater than or equal to `{MIN_MATCH_ID}`.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        track_summary = await self.bot.deadlock_callbacks.track_existing_live_match(interaction.guild_id, match_id)
+        if track_summary.status == LiveMatchTrackStatus.SUCCESS:
+            if track_summary.resulting_status is not None and track_summary.resulting_status.value == "in_progress":
+                await interaction.followup.send(
+                    f"✅ Match `{match_id}` is now tracked for heartbeat updates.",
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.followup.send(
+                f"Info: match `{match_id}` was found, but metadata indicates it is already finished.",
+                ephemeral=True,
+            )
+            return
+
+        if track_summary.status == LiveMatchTrackStatus.MATCH_NOT_TRACKED:
+            await interaction.followup.send(
+                (
+                    f"❌ Match `{match_id}` is not currently stored in `{LIVE_MATCH_POSTS_COLLECTION_NAME}` "
+                    "for this server, so it cannot be tracked."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        if track_summary.status == LiveMatchTrackStatus.API_VALIDATION_FAILED:
+            if track_summary.api_status_code == 429 and track_summary.api_retry_after_seconds is not None:
+                await interaction.followup.send(
+                    (
+                        "❌ Could not validate that match right now because the API is rate limited. "
+                        f"Try again in about {track_summary.api_retry_after_seconds}s."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            if track_summary.api_status_code is not None:
+                await interaction.followup.send(
+                    (
+                        f"❌ Could not validate match `{match_id}` with the API (status "
+                        f"{track_summary.api_status_code})."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            await interaction.followup.send(
+                f"❌ Could not validate match `{match_id}` with the API.",
+                ephemeral=True,
+            )
+            return
+
+        if track_summary.status == LiveMatchTrackStatus.DATABASE_UNAVAILABLE:
+            await interaction.followup.send(
+                "❌ Tracking failed because the database connection is unavailable.",
+                ephemeral=True,
+            )
+            return
+
+        if track_summary.status == LiveMatchTrackStatus.INVALID_INPUT:
+            await interaction.followup.send(
+                "❌ Tracking failed because the supplied match ID was invalid.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(
+            "❌ Tracking failed while updating match tracking state. Check logs and try again.",
             ephemeral=True,
         )
 

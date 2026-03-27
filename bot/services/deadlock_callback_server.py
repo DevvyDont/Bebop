@@ -9,6 +9,7 @@ import logging
 import random
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -81,6 +82,43 @@ class CallbackTrackingResetSummary:
     deleted_live_match_message_count: int
     cleared_live_match_post_count: int
     cleared_match_history_count: int
+
+
+class MatchIdRemapStatus(StrEnum):
+    SUCCESS = "success"
+    INVALID_INPUT = "invalid_input"
+    DATABASE_UNAVAILABLE = "database_unavailable"
+    OLD_MATCH_NOT_FOUND = "old_match_not_found"
+    NEW_MATCH_ALREADY_TRACKED = "new_match_already_tracked"
+    PERSISTENCE_ERROR = "persistence_error"
+
+
+@dataclass(frozen=True, slots=True)
+class MatchIdRemapSummary:
+    status: MatchIdRemapStatus
+    old_match_id: int
+    new_match_id: int
+    updated_live_match_post_count: int = 0
+    updated_match_history_count: int = 0
+    synced_live_match_post: bool = False
+
+
+class LiveMatchTrackStatus(StrEnum):
+    SUCCESS = "success"
+    INVALID_INPUT = "invalid_input"
+    DATABASE_UNAVAILABLE = "database_unavailable"
+    MATCH_NOT_TRACKED = "match_not_tracked"
+    API_VALIDATION_FAILED = "api_validation_failed"
+    PERSISTENCE_ERROR = "persistence_error"
+
+
+@dataclass(frozen=True, slots=True)
+class LiveMatchTrackSummary:
+    status: LiveMatchTrackStatus
+    match_id: int
+    resulting_status: LiveMatchPostStatus | None = None
+    api_status_code: int | None = None
+    api_retry_after_seconds: int | None = None
 
 
 class DeadlockCallbackServer:
@@ -264,6 +302,139 @@ class DeadlockCallbackServer:
             deleted_live_match_message_count=deleted_live_match_message_count,
             cleared_live_match_post_count=cleared_live_match_post_count,
             cleared_match_history_count=cleared_match_history_count,
+        )
+
+    async def remap_tracked_match_id(self, guild_id: int, old_match_id: int, new_match_id: int) -> MatchIdRemapSummary:
+        if old_match_id <= 0 or new_match_id <= 0 or old_match_id == new_match_id:
+            return MatchIdRemapSummary(
+                status=MatchIdRemapStatus.INVALID_INPUT,
+                old_match_id=old_match_id,
+                new_match_id=new_match_id,
+            )
+
+        database = self._bot.database.db
+        if database is None:
+            return MatchIdRemapSummary(
+                status=MatchIdRemapStatus.DATABASE_UNAVAILABLE,
+                old_match_id=old_match_id,
+                new_match_id=new_match_id,
+            )
+
+        live_match_collection = database[LIVE_MATCH_POSTS_COLLECTION_NAME]
+        match_history_collection = database[MATCH_HISTORY_COLLECTION_NAME]
+
+        old_live_match_record = await live_match_collection.find_one(
+            {"guild_id": guild_id, "match_id": old_match_id}
+        )
+        old_match_history_record = await match_history_collection.find_one(
+            {"guild_id": guild_id, "match_id": old_match_id}
+        )
+        if not isinstance(old_live_match_record, dict) and not isinstance(old_match_history_record, dict):
+            return MatchIdRemapSummary(
+                status=MatchIdRemapStatus.OLD_MATCH_NOT_FOUND,
+                old_match_id=old_match_id,
+                new_match_id=new_match_id,
+            )
+
+        new_live_match_record = await live_match_collection.find_one(
+            {"guild_id": guild_id, "match_id": new_match_id}
+        )
+        new_match_history_record = await match_history_collection.find_one(
+            {"guild_id": guild_id, "match_id": new_match_id}
+        )
+        if isinstance(new_live_match_record, dict) or isinstance(new_match_history_record, dict):
+            return MatchIdRemapSummary(
+                status=MatchIdRemapStatus.NEW_MATCH_ALREADY_TRACKED,
+                old_match_id=old_match_id,
+                new_match_id=new_match_id,
+            )
+
+        updated_live_match_post_count = 0
+        updated_match_history_count = 0
+        try:
+            live_update_result = await live_match_collection.update_one(
+                {"guild_id": guild_id, "match_id": old_match_id},
+                {"$set": {"match_id": new_match_id}},
+            )
+            updated_live_match_post_count = live_update_result.modified_count
+
+            history_update_result = await match_history_collection.update_one(
+                {"guild_id": guild_id, "match_id": old_match_id},
+                {"$set": {"match_id": new_match_id}},
+            )
+            updated_match_history_count = history_update_result.modified_count
+        except PyMongoError:
+            log.exception(
+                "Failed to remap tracked match_id from %s to %s in guild %s",
+                old_match_id,
+                new_match_id,
+                guild_id,
+            )
+            return MatchIdRemapSummary(
+                status=MatchIdRemapStatus.PERSISTENCE_ERROR,
+                old_match_id=old_match_id,
+                new_match_id=new_match_id,
+                updated_live_match_post_count=updated_live_match_post_count,
+                updated_match_history_count=updated_match_history_count,
+            )
+
+        remapped_live_record = await self._get_live_match_post_by_guild_and_match_id(guild_id, new_match_id)
+        synced_live_match_post = False
+        if remapped_live_record is not None:
+            await self._sync_live_match_post_message(remapped_live_record)
+            synced_live_match_post = True
+
+        return MatchIdRemapSummary(
+            status=MatchIdRemapStatus.SUCCESS,
+            old_match_id=old_match_id,
+            new_match_id=new_match_id,
+            updated_live_match_post_count=updated_live_match_post_count,
+            updated_match_history_count=updated_match_history_count,
+            synced_live_match_post=synced_live_match_post,
+        )
+
+    async def track_existing_live_match(self, guild_id: int, match_id: int) -> LiveMatchTrackSummary:
+        if match_id <= 0:
+            return LiveMatchTrackSummary(status=LiveMatchTrackStatus.INVALID_INPUT, match_id=match_id)
+
+        database = self._bot.database.db
+        if database is None:
+            return LiveMatchTrackSummary(status=LiveMatchTrackStatus.DATABASE_UNAVAILABLE, match_id=match_id)
+
+        existing_record = await self._get_live_match_post_by_guild_and_match_id(guild_id, match_id)
+        if existing_record is None:
+            return LiveMatchTrackSummary(status=LiveMatchTrackStatus.MATCH_NOT_TRACKED, match_id=match_id)
+
+        try:
+            metadata = await self._bot.deadlock_api.get_match_metadata(match_id, is_custom=True)
+        except DeadlockApiRequestError as error:
+            return LiveMatchTrackSummary(
+                status=LiveMatchTrackStatus.API_VALIDATION_FAILED,
+                match_id=match_id,
+                api_status_code=error.status_code,
+                api_retry_after_seconds=error.retry_after_seconds,
+            )
+
+        refreshed_at = datetime.now(UTC)
+        seeded_record = existing_record.model_copy(
+            update={
+                "status": LiveMatchPostStatus.IN_PROGRESS,
+                "cleanup_completed_at": None,
+            }
+        )
+        updated_record = self._apply_match_metadata_to_record(seeded_record, metadata, refreshed_at)
+
+        try:
+            await self._upsert_live_match_post_record(updated_record)
+            await self._sync_live_match_post_message(updated_record)
+        except (PyMongoError, discord.HTTPException):
+            log.exception("Failed to re-arm tracking for guild=%s match_id=%s", guild_id, match_id)
+            return LiveMatchTrackSummary(status=LiveMatchTrackStatus.PERSISTENCE_ERROR, match_id=match_id)
+
+        return LiveMatchTrackSummary(
+            status=LiveMatchTrackStatus.SUCCESS,
+            match_id=match_id,
+            resulting_status=updated_record.status,
         )
 
     def _start_live_match_heartbeat(self) -> None:
@@ -759,6 +930,25 @@ class DeadlockCallbackServer:
             return LiveMatchPostRecord.model_validate(raw_record)
         except ValidationError:
             log.warning("Skipping invalid live match post record for match_id=%s", match_id)
+            return None
+
+    async def _get_live_match_post_by_guild_and_match_id(
+        self,
+        guild_id: int,
+        match_id: int,
+    ) -> LiveMatchPostRecord | None:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return None
+
+        raw_record = await collection.find_one({"guild_id": guild_id, "match_id": match_id})
+        if not isinstance(raw_record, dict):
+            return None
+
+        try:
+            return LiveMatchPostRecord.model_validate(raw_record)
+        except ValidationError:
+            log.warning("Skipping invalid live match post record for guild=%s match_id=%s", guild_id, match_id)
             return None
 
     async def _get_live_match_post_by_message(
