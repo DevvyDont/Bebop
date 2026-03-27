@@ -50,6 +50,13 @@ CUSTOM_LOBBY_MANUAL_MESSAGE = (
     "Lobby details were not created automatically. A match admin will post the lobby info shortly."
 )
 CUSTOM_LOBBY_CREATED_MESSAGE = "Party is live — join up and get ready."
+LIVE_MATCH_POSTS_COLLECTION_NAME = "live_match_posts"
+REMAKE_COMMAND_GUIDANCE = (
+    "If party creation breaks or the game fails to start cleanly, use `/remake` to vote for a remake "
+    "during the first 15 minutes."
+)
+REMAKE_VOTE_RECORDED_MESSAGE = "Your remake vote is recorded."
+REMAKE_READY_MESSAGE = "Remake approved. Recreating the custom lobby now."
 MATCH_HISTORY_COLLECTION_NAME = "match_history"
 DEFAULT_MATCH_HISTORY_LIMIT = 10
 MAX_MATCH_HISTORY_LIMIT = 20
@@ -58,6 +65,8 @@ STANDARD_TURN_PICK_COUNT = 2
 MIN_HERO_PICK_COUNT = 3
 MAX_HERO_CHOICES_DISPLAY = 6
 HERO_ROUND_TWO_REMINDER_SECONDS = 90
+REMAKE_WINDOW_SECONDS = 900  # 15 minutes — players may vote to remake within this window after party creation
+MAX_REMAKE_COUNT = 2  # Number of successful remakes allowed before the next vote cancels the match entirely
 
 
 class QueueAction(StrEnum):
@@ -139,6 +148,20 @@ class HeroSelectionSession:
 
 
 @dataclass(slots=True)
+class RemakeSession:
+    """Tracks in-flight remake votes for a single match party creation attempt."""
+
+    guild_id: int
+    match_number: int
+    text_channel_id: int
+    all_player_ids: frozenset[int]
+    votes: set[int] = field(default_factory=set)
+    majority_triggered: bool = False
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass(slots=True)
 class QueueDraftSettings:
     team_assignment_mode: TeamAssignmentMode = TeamAssignmentMode.CAPTAIN_DRAFT
     captain_selection_mode: CaptainSelectionMode = CaptainSelectionMode.RANDOM
@@ -153,11 +176,14 @@ class ActiveMatch:
     team_a_voice_channel_id: int | None = None
     team_b_voice_channel_id: int | None = None
     deadlock_party_id: str | None = None
+    deadlock_party_code: str | None = None
     callback_token: str | None = None
     captain_a_id: int | None = None
     captain_b_id: int | None = None
     drafted_player_order: tuple[int, ...] = ()
     assigned_heroes: tuple[tuple[int, str], ...] = ()
+    remake_count: int = 0
+    party_created_at: datetime | None = None
 
 
 @dataclass(slots=True)
@@ -202,7 +228,13 @@ def _build_status_embed(state: QueueState, entries: tuple[QueueEntry, ...], upda
         value=_format_player_list(entries),
         inline=False,
     )
-    embed.set_footer(text=f"State: {state_label}  •  Updated {discord.utils.format_dt(updated_at, style='R')}")
+    embed.add_field(
+        name="Queue Status",
+        value=f"{state_label}\nUpdated {discord.utils.format_dt(updated_at, style='R')}",
+        inline=False,
+    )
+    embed.timestamp = updated_at
+    embed.set_footer(text="Bebop Queue")
     return embed
 
 
@@ -377,6 +409,7 @@ class QueueCog(commands.Cog, name="Queue"):
         self._draft_settings_by_guild: dict[int, QueueDraftSettings] = {}
         self._draft_sessions_by_guild: dict[int, dict[int, CaptainDraftSession]] = {}
         self._hero_selection_sessions_by_guild: dict[int, dict[int, HeroSelectionSession]] = {}
+        self._remake_sessions_by_guild: dict[int, dict[int, RemakeSession]] = {}
         self._background_tasks: set[asyncio.Task[None]] = set()
 
     def _get_draft_session(self, guild_id: int, match_number: int) -> CaptainDraftSession | None:
@@ -433,11 +466,234 @@ class QueueCog(commands.Cog, name="Queue"):
                 return session
         return None
 
+    def _get_remake_session(self, guild_id: int, match_number: int) -> RemakeSession | None:
+        guild_sessions = self._remake_sessions_by_guild.get(guild_id)
+        if guild_sessions is None:
+            return None
+        return guild_sessions.get(match_number)
+
+    def _set_remake_session(self, session: RemakeSession) -> None:
+        guild_sessions = self._remake_sessions_by_guild.setdefault(session.guild_id, {})
+        guild_sessions[session.match_number] = session
+
+    def _pop_remake_session(self, guild_id: int, match_number: int) -> RemakeSession | None:
+        guild_sessions = self._remake_sessions_by_guild.get(guild_id)
+        if guild_sessions is None:
+            return None
+
+        removed_session = guild_sessions.pop(match_number, None)
+        if guild_sessions:
+            return removed_session
+
+        self._remake_sessions_by_guild.pop(guild_id, None)
+        return removed_session
+
     def _create_background_task(self, coro: Coroutine[object, object, None]) -> None:
         """Schedule a fire-and-forget coroutine, keeping a strong reference to prevent GC."""
         task: asyncio.Task[None] = asyncio.create_task(coro)  # type: ignore[arg-type]
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+    def _get_active_match_by_channel(self, guild_id: int, channel_id: int) -> ActiveMatch | None:
+        matches_by_number = self._active_matches_by_guild.get(guild_id)
+        if matches_by_number is None:
+            return None
+
+        for active_match in matches_by_number.values():
+            if active_match.text_channel_id == channel_id:
+                return active_match
+        return None
+
+    @staticmethod
+    def _match_player_ids(active_match: ActiveMatch) -> tuple[int, ...]:
+        return (*active_match.team_a_ids, *active_match.team_b_ids)
+
+    @staticmethod
+    def _required_remake_votes(total_players: int) -> int:
+        return (total_players // 2) + 1
+
+    @staticmethod
+    def _remake_window_seconds_remaining(active_match: ActiveMatch, now: datetime) -> int:
+        if active_match.party_created_at is None:
+            return 0
+        elapsed_seconds = int((now - active_match.party_created_at).total_seconds())
+        return max(REMAKE_WINDOW_SECONDS - elapsed_seconds, 0)
+
+    def _ensure_remake_session(self, active_match: ActiveMatch, guild_id: int) -> RemakeSession:
+        all_player_ids = frozenset(self._match_player_ids(active_match))
+        existing_session = self._get_remake_session(guild_id, active_match.match_number)
+        if existing_session is not None and existing_session.all_player_ids == all_player_ids:
+            return existing_session
+
+        remake_session = RemakeSession(
+            guild_id=guild_id,
+            match_number=active_match.match_number,
+            text_channel_id=active_match.text_channel_id,
+            all_player_ids=all_player_ids,
+        )
+        self._set_remake_session(remake_session)
+        return remake_session
+
+    @staticmethod
+    def _build_remake_vote_momentum_message(
+        voter_id: int,
+        vote_count: int,
+        required_votes: int,
+        remaining_window_seconds: int,
+    ) -> str:
+        remaining_votes = max(required_votes - vote_count, 0)
+        if remaining_votes == 0:
+            return (
+                f"🗳️ <@{voter_id}> voted to remake. Vote is now **{vote_count}/{required_votes}** and "
+                "has reached majority."
+            )
+
+        return (
+            f"🗳️ <@{voter_id}> voted to remake. Vote is now **{vote_count}/{required_votes}** "
+            f"({remaining_votes} more needed, {remaining_window_seconds}s left)."
+        )
+
+    async def _send_match_text_channel_message(self, channel_id: int, message: str) -> None:
+        channel = self.bot.get_channel(channel_id)
+        if not isinstance(channel, discord.TextChannel):
+            return
+        with contextlib.suppress(discord.HTTPException):
+            await channel.send(message)
+
+    async def _run_remake_for_match(self, guild_id: int, active_match: ActiveMatch) -> tuple[bool, str]:
+        if active_match.deadlock_party_id is None:
+            return False, "❌ This match does not have an active custom lobby to remake."
+
+        if not active_match.assigned_heroes:
+            return False, "❌ Hero assignments are missing, so remake cannot recreate this lobby safely."
+
+        if active_match.remake_count >= MAX_REMAKE_COUNT:
+            old_party_id = active_match.deadlock_party_id
+            try:
+                await self.bot.deadlock_api.leave_custom_match(old_party_id)
+            except DeadlockApiConfigurationError:
+                log.warning(
+                    "Skipping Deadlock lobby leave during remake cancellation because API key is not configured."
+                )
+            except DeadlockApiRequestError as error:
+                log.warning(
+                    "Deadlock lobby leave failed during remake cancellation (status=%s, body=%s): %s",
+                    error.status_code,
+                    error.response_body,
+                    error.message,
+                )
+
+            await self._delete_active_match_channels(guild_id, active_match)
+            return True, "🧹 Remake limit reached, so this match was cancelled and cleaned up."
+
+        old_party_id = active_match.deadlock_party_id
+        try:
+            await self.bot.deadlock_api.leave_custom_match(old_party_id)
+        except DeadlockApiConfigurationError:
+            return False, "❌ Remake failed because the Deadlock API key is not configured."
+        except DeadlockApiRequestError as error:
+            return False, (
+                "❌ Remake failed while closing the previous custom lobby"
+                f" (status={error.status_code})."
+            )
+
+        await self.bot.deadlock_callbacks.retire_party_id(old_party_id)
+        if active_match.callback_token is not None:
+            await self.bot.deadlock_callbacks.discard_pending_callback(active_match.callback_token)
+
+        replacement_lobby = await self._create_deadlock_custom_lobby(
+            guild_id,
+            active_match.match_number,
+            active_match.text_channel_id,
+            active_match.team_a_ids,
+            active_match.team_b_ids,
+            active_match.assigned_heroes,
+        )
+
+        replacement_party_id: str | None = None
+        replacement_party_code: str | None = None
+        replacement_callback_token: str | None = None
+        if replacement_lobby is not None:
+            replacement_party_id, replacement_party_code, replacement_callback_token = replacement_lobby
+
+        replacement_party_created_at: datetime | None = None
+        if replacement_party_id is not None:
+            replacement_party_created_at = datetime.now(UTC)
+
+        updated_match = ActiveMatch(
+            match_number=active_match.match_number,
+            team_a_ids=active_match.team_a_ids,
+            team_b_ids=active_match.team_b_ids,
+            text_channel_id=active_match.text_channel_id,
+            team_a_voice_channel_id=active_match.team_a_voice_channel_id,
+            team_b_voice_channel_id=active_match.team_b_voice_channel_id,
+            deadlock_party_id=replacement_party_id,
+            deadlock_party_code=replacement_party_code,
+            callback_token=replacement_callback_token,
+            captain_a_id=active_match.captain_a_id,
+            captain_b_id=active_match.captain_b_id,
+            drafted_player_order=active_match.drafted_player_order,
+            assigned_heroes=active_match.assigned_heroes,
+            remake_count=active_match.remake_count + 1,
+            party_created_at=replacement_party_created_at,
+        )
+        self._active_matches_by_guild.setdefault(guild_id, {})[active_match.match_number] = updated_match
+
+        self._pop_remake_session(guild_id, active_match.match_number)
+        if replacement_party_id is not None:
+            self._set_remake_session(
+                RemakeSession(
+                    guild_id=guild_id,
+                    match_number=active_match.match_number,
+                    text_channel_id=active_match.text_channel_id,
+                    all_player_ids=frozenset(self._match_player_ids(updated_match)),
+                )
+            )
+
+        if replacement_party_id is None or replacement_party_code is None:
+            return True, (
+                "⚠️ Remake passed and the previous lobby was closed, but a replacement lobby could not be created. "
+                "A match admin should post manual lobby details."
+            )
+
+        return True, (
+            f"✅ Remake complete. New party code: `{replacement_party_code}` "
+            f"(Lobby ID: `{replacement_party_id}`)."
+        )
+
+    def _build_remake_lobby_ready_embed(self, active_match: ActiveMatch) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Match {active_match.match_number} Lobby Remade",
+            description=(
+                "Join the new party using the code below. Teams and hero picks are unchanged, and the remake "
+                "window is still active."
+            ),
+            color=COLOR_LOBBY_READY,
+        )
+        hidden_king_lines = [
+            f"<@{user_id}> - **{dict(active_match.assigned_heroes).get(user_id, 'Unassigned')}**"
+            for user_id in active_match.team_a_ids
+        ]
+        archmother_lines = [
+            f"<@{user_id}> - **{dict(active_match.assigned_heroes).get(user_id, 'Unassigned')}**"
+            for user_id in active_match.team_b_ids
+        ]
+        embed.add_field(name="Hidden King", value="\n".join(hidden_king_lines) or "*No players*", inline=False)
+        embed.add_field(name="Archmother", value="\n".join(archmother_lines) or "*No players*", inline=False)
+
+        if active_match.deadlock_party_code is not None:
+            embed.add_field(name="Party Code", value=f"`{active_match.deadlock_party_code}`", inline=False)
+        if active_match.deadlock_party_id is not None:
+            embed.add_field(name="Lobby ID", value=f"`{active_match.deadlock_party_id}`", inline=False)
+
+        embed.add_field(name="Need a remake?", value=REMAKE_COMMAND_GUIDANCE, inline=False)
+
+        embed.add_field(
+            name="Remakes Used",
+            value=f"{active_match.remake_count}/{MAX_REMAKE_COUNT}",
+            inline=False,
+        )
+        return embed
 
     @staticmethod
     def _parse_hero_preferences(message_content: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
@@ -728,8 +984,9 @@ class QueueCog(commands.Cog, name="Queue"):
         removed_match = self._forget_active_match(guild_id, match_channels.match_number)
         self._pop_draft_session(guild_id, match_channels.match_number)
         self._pop_hero_selection_session(guild_id, match_channels.match_number)
+        self._pop_remake_session(guild_id, match_channels.match_number)
         if removed_match is not None and removed_match.deadlock_party_id is not None:
-            await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
+            await self.bot.deadlock_callbacks.retire_party_id(removed_match.deadlock_party_id)
 
         if removed_match is not None and removed_match.callback_token is not None:
             await self.bot.deadlock_callbacks.discard_pending_callback(removed_match.callback_token)
@@ -833,8 +1090,9 @@ class QueueCog(commands.Cog, name="Queue"):
         removed_match = self._forget_active_match(guild_id, match.match_number)
         self._pop_draft_session(guild_id, match.match_number)
         self._pop_hero_selection_session(guild_id, match.match_number)
+        self._pop_remake_session(guild_id, match.match_number)
         if removed_match is not None and removed_match.deadlock_party_id is not None:
-            await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
+            await self.bot.deadlock_callbacks.retire_party_id(removed_match.deadlock_party_id)
 
         if removed_match is not None and removed_match.callback_token is not None:
             await self.bot.deadlock_callbacks.discard_pending_callback(removed_match.callback_token)
@@ -848,13 +1106,14 @@ class QueueCog(commands.Cog, name="Queue"):
         active_matches = self._active_matches_by_guild.pop(guild_id, {})
         for active_match in active_matches.values():
             if active_match.deadlock_party_id is not None:
-                await self.bot.deadlock_callbacks.unregister_party_id(active_match.deadlock_party_id)
+                await self.bot.deadlock_callbacks.retire_party_id(active_match.deadlock_party_id)
 
             if active_match.callback_token is not None:
                 await self.bot.deadlock_callbacks.discard_pending_callback(active_match.callback_token)
 
         self._draft_sessions_by_guild.pop(guild_id, None)
         self._hero_selection_sessions_by_guild.pop(guild_id, None)
+        self._remake_sessions_by_guild.pop(guild_id, None)
 
         self._next_match_number_by_guild.pop(guild_id, None)
         return deleted_channel_count
@@ -904,9 +1163,10 @@ class QueueCog(commands.Cog, name="Queue"):
             removed_match = self._forget_active_match(guild_id, match_number)
             self._pop_draft_session(guild_id, match_number)
             self._pop_hero_selection_session(guild_id, match_number)
+            self._pop_remake_session(guild_id, match_number)
 
             if removed_match is not None and removed_match.deadlock_party_id is not None:
-                await self.bot.deadlock_callbacks.unregister_party_id(removed_match.deadlock_party_id)
+                await self.bot.deadlock_callbacks.retire_party_id(removed_match.deadlock_party_id)
             if removed_match is not None and removed_match.callback_token is not None:
                 await self.bot.deadlock_callbacks.discard_pending_callback(removed_match.callback_token)
             return True
@@ -1089,7 +1349,7 @@ class QueueCog(commands.Cog, name="Queue"):
             callback_url=callback_url,
             disable_auto_ready=settings.deadlock_custom_disable_auto_ready,
             game_mode=settings.deadlock_custom_game_mode,
-            is_publicly_visible=settings.deadlock_custom_is_publicly_visible,
+            is_publicly_visible=True,
             min_roster_size=min_roster_size,
             server_region=settings.deadlock_custom_server_region,
         )
@@ -1483,13 +1743,26 @@ class QueueCog(commands.Cog, name="Queue"):
             team_a_voice_channel_id=active_match.team_a_voice_channel_id,
             team_b_voice_channel_id=active_match.team_b_voice_channel_id,
             deadlock_party_id=party_id,
+            deadlock_party_code=party_code,
             callback_token=callback_token,
             captain_a_id=active_match.captain_a_id,
             captain_b_id=active_match.captain_b_id,
             drafted_player_order=active_match.drafted_player_order,
             assigned_heroes=tuple((user_id, hero_name) for user_id, hero_name in session.assigned_hero_by_user.items()),
+            remake_count=active_match.remake_count,
+            party_created_at=datetime.now(UTC) if party_id is not None else None,
         )
         self._active_matches_by_guild.setdefault(session.guild_id, {})[session.match_number] = updated_match
+        self._pop_remake_session(session.guild_id, session.match_number)
+        if party_id is not None:
+            self._set_remake_session(
+                RemakeSession(
+                    guild_id=session.guild_id,
+                    match_number=session.match_number,
+                    text_channel_id=session.text_channel_id,
+                    all_player_ids=frozenset(self._match_player_ids(updated_match)),
+                )
+            )
 
         channel = self.bot.get_channel(session.text_channel_id)
         if isinstance(channel, discord.TextChannel):
@@ -1531,6 +1804,7 @@ class QueueCog(commands.Cog, name="Queue"):
                 final_embed.add_field(name="Party Code", value=f"`{party_code}`", inline=False)
                 final_embed.add_field(name="Lobby ID", value=f"`{party_id}`", inline=False)
                 final_embed.add_field(name="Custom Lobby", value=CUSTOM_LOBBY_CREATED_MESSAGE, inline=False)
+                final_embed.add_field(name="Need a remake?", value=REMAKE_COMMAND_GUIDANCE, inline=False)
 
             await channel.send(
                 content=f"||{match_mentions}||",
@@ -1955,6 +2229,169 @@ class QueueCog(commands.Cog, name="Queue"):
         state, entries, updated_at = await self.bot.queue_repository.get_queue_state(interaction.guild_id)
         await interaction.response.send_message(embed=_build_status_embed(state, entries, updated_at), ephemeral=True)
 
+    @app_commands.command(name="remake", description="Vote to remake the current match lobby.")
+    async def queue_remake(self, interaction: discord.Interaction[BebopBot]) -> None:
+        if interaction.guild_id is None or interaction.channel_id is None:
+            return
+
+        active_match = self._get_active_match_by_channel(interaction.guild_id, interaction.channel_id)
+        if active_match is None:
+            await interaction.response.send_message(
+                "❌ This command can only be used in an active match text channel.",
+                ephemeral=True,
+            )
+            return
+
+        all_player_ids = self._match_player_ids(active_match)
+        if interaction.user.id not in all_player_ids:
+            await interaction.response.send_message(
+                "❌ Only players assigned to this match can vote to remake.",
+                ephemeral=True,
+            )
+            return
+
+        if active_match.deadlock_party_id is None or active_match.party_created_at is None:
+            await interaction.response.send_message(
+                "❌ This match does not have an active custom lobby to remake.",
+                ephemeral=True,
+            )
+            return
+
+        now = datetime.now(UTC)
+        remaining_window_seconds = self._remake_window_seconds_remaining(active_match, now)
+        if remaining_window_seconds <= 0:
+            await interaction.response.send_message(
+                "❌ The remake window has expired for this lobby.",
+                ephemeral=True,
+            )
+            return
+
+        remake_session = self._ensure_remake_session(active_match, interaction.guild_id)
+        required_votes = self._required_remake_votes(len(remake_session.all_player_ids))
+        should_execute_remake = False
+        vote_count_after_submit = 0
+        async with remake_session.lock:
+            if remake_session.majority_triggered:
+                await interaction.response.send_message(
+                    "⏳ A remake vote already passed and is being processed.",
+                    ephemeral=True,
+                )
+                return
+
+            if interaction.user.id in remake_session.votes:
+                await interaction.response.send_message(
+                    "Info: your remake vote is already counted.",
+                    ephemeral=True,
+                )
+                return
+
+            remake_session.votes.add(interaction.user.id)
+            vote_count_after_submit = len(remake_session.votes)
+            if vote_count_after_submit >= required_votes:
+                remake_session.majority_triggered = True
+                should_execute_remake = True
+
+        momentum_message = self._build_remake_vote_momentum_message(
+            interaction.user.id,
+            vote_count_after_submit,
+            required_votes,
+            remaining_window_seconds,
+        )
+
+        if not should_execute_remake:
+            await interaction.response.send_message(
+                (
+                    f"✅ {REMAKE_VOTE_RECORDED_MESSAGE} "
+                    f"Current votes: **{vote_count_after_submit}/{required_votes}**."
+                ),
+                ephemeral=True,
+            )
+            await self._send_match_text_channel_message(active_match.text_channel_id, momentum_message)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await self._send_match_text_channel_message(active_match.text_channel_id, momentum_message)
+        succeeded, result_message = await self._run_remake_for_match(interaction.guild_id, active_match)
+        if succeeded:
+            await self._send_match_text_channel_message(active_match.text_channel_id, f"🔁 {REMAKE_READY_MESSAGE}")
+            refreshed_match = self._active_matches_by_guild.get(interaction.guild_id, {}).get(active_match.match_number)
+            if (
+                refreshed_match is not None
+                and refreshed_match.deadlock_party_id is not None
+                and refreshed_match.deadlock_party_code is not None
+            ):
+                match_mentions = self._format_player_mentions(self._match_player_ids(refreshed_match))
+                await interaction.followup.send(result_message, ephemeral=True)
+                channel = self.bot.get_channel(active_match.text_channel_id)
+                if isinstance(channel, discord.TextChannel):
+                    await channel.send(
+                        content=f"||{match_mentions}||",
+                        embed=self._build_remake_lobby_ready_embed(refreshed_match),
+                        allowed_mentions=discord.AllowedMentions(users=True),
+                    )
+                return
+
+            await self._send_match_text_channel_message(active_match.text_channel_id, result_message)
+        else:
+            remake_session = self._get_remake_session(interaction.guild_id, active_match.match_number)
+            if remake_session is not None:
+                async with remake_session.lock:
+                    remake_session.majority_triggered = False
+
+        await interaction.followup.send(result_message, ephemeral=True)
+
+    @queue_group.command(name="remake-status", description="View remake vote status for the current match lobby.")
+    async def queue_remake_status(self, interaction: discord.Interaction[BebopBot]) -> None:
+        if interaction.guild_id is None or interaction.channel_id is None:
+            return
+
+        active_match = self._get_active_match_by_channel(interaction.guild_id, interaction.channel_id)
+        if active_match is None:
+            await interaction.response.send_message(
+                "❌ This command can only be used in an active match text channel.",
+                ephemeral=True,
+            )
+            return
+
+        all_player_ids = self._match_player_ids(active_match)
+        if interaction.user.id not in all_player_ids:
+            await interaction.response.send_message(
+                "❌ Only players assigned to this match can view remake status.",
+                ephemeral=True,
+            )
+            return
+
+        remaining_window_seconds = self._remake_window_seconds_remaining(active_match, datetime.now(UTC))
+        if active_match.deadlock_party_id is None or active_match.party_created_at is None:
+            await interaction.response.send_message(
+                "Info: this match does not currently have an active custom lobby.",
+                ephemeral=True,
+            )
+            return
+
+        remake_session = self._ensure_remake_session(active_match, interaction.guild_id)
+        required_votes = self._required_remake_votes(len(remake_session.all_player_ids))
+        vote_count = len(remake_session.votes)
+        remaining_votes = max(required_votes - vote_count, 0)
+        status_embed = discord.Embed(
+            title=f"Match {active_match.match_number} Remake Status",
+            color=discord.Color.orange(),
+        )
+        status_embed.add_field(name="Votes", value=f"{vote_count}/{required_votes}", inline=False)
+        status_embed.add_field(name="Votes Needed", value=str(remaining_votes), inline=False)
+        status_embed.add_field(
+            name="Window Remaining",
+            value=f"{remaining_window_seconds}s",
+            inline=False,
+        )
+        status_embed.add_field(
+            name="Successful Remakes",
+            value=f"{active_match.remake_count}/{MAX_REMAKE_COUNT}",
+            inline=False,
+        )
+
+        await interaction.response.send_message(embed=status_embed, ephemeral=True)
+
     @queue_group.command(name="history", description="View recent match history for yourself or another user.")
     async def queue_history(
         self,
@@ -2075,6 +2512,42 @@ class QueueCog(commands.Cog, name="Queue"):
         await interaction.response.send_message(f"✅ Removed {player.mention} from the queue.", ephemeral=True)
         await self._sync_queue_message(interaction.guild_id)
 
+    @queue_group.command(name="remake-force", description="[Admin] Force a remake for an active match.")
+    @app_commands.check(_admin_check)
+    async def queue_remake_force(
+        self,
+        interaction: discord.Interaction[BebopBot],
+        match_number: int | None = None,
+    ) -> None:
+        if interaction.guild_id is None:
+            return
+
+        active_match: ActiveMatch | None = None
+        if match_number is None:
+            if interaction.channel_id is None:
+                return
+            active_match = self._get_active_match_by_channel(interaction.guild_id, interaction.channel_id)
+        else:
+            active_match = self._active_matches_by_guild.get(interaction.guild_id, {}).get(match_number)
+
+        if active_match is None:
+            await interaction.response.send_message(
+                "❌ Could not find an active match for remake-force.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        succeeded, result_message = await self._run_remake_for_match(interaction.guild_id, active_match)
+        if succeeded:
+            await self._send_match_text_channel_message(
+                active_match.text_channel_id,
+                f"🛠️ Admin forced a remake for match `{active_match.match_number}`.",
+            )
+            await self._send_match_text_channel_message(active_match.text_channel_id, result_message)
+
+        await interaction.followup.send(result_message, ephemeral=True)
+
     @queue_group.command(name="cancel-match", description="[Admin] Cancel a specific match and delete its channels.")
     @app_commands.check(_admin_check)
     async def queue_cancel_match(self, interaction: discord.Interaction[BebopBot], match_number: int) -> None:
@@ -2110,7 +2583,7 @@ class QueueCog(commands.Cog, name="Queue"):
             ephemeral=True,
         )
 
-    @queue_group.command(name="reset", description="[Admin] Clear the entire queue and reset its state.")
+    @queue_group.command(name="reset", description="[Admin] Clear queue, matches, and persisted bot state.")
     @app_commands.check(_admin_check)
     async def queue_reset(self, interaction: discord.Interaction[BebopBot]) -> None:
         if interaction.guild_id is None:
@@ -2118,8 +2591,19 @@ class QueueCog(commands.Cog, name="Queue"):
 
         await self.bot.queue_repository.clear(interaction.guild_id)
         deleted_channel_count = await self._delete_all_match_channels(interaction.guild_id)
+        reset_summary = await self.bot.deadlock_callbacks.reset_tracking_state()
         await interaction.response.send_message(
-            f"🗑️ Queue has been reset. Deleted {deleted_channel_count} managed match channel(s).",
+            (
+                "🗑️ Bebop has been reset.\n"
+                f"• Deleted **{deleted_channel_count}** managed match channel(s).\n"
+                f"• Removed **{reset_summary.deleted_live_match_message_count}** tracked live match post(s).\n"
+                f"• Cleared **{reset_summary.cleared_live_match_post_count}** live match record(s) from "
+                f"`{LIVE_MATCH_POSTS_COLLECTION_NAME}`.\n"
+                f"• Cleared **{reset_summary.cleared_match_history_count}** match history record(s) from "
+                f"`{MATCH_HISTORY_COLLECTION_NAME}`.\n"
+                f"• Discarded **{reset_summary.pending_callback_count}** pending callback(s) and "
+                f"**{reset_summary.active_callback_count}** active callback(s)."
+            ),
             ephemeral=True,
         )
         await self._sync_queue_message(interaction.guild_id)

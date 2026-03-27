@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     deadlock_custom_game_mode: DeadlockGameMode = DeadlockGameMode.NORMAL
     deadlock_custom_server_region: DeadlockServerRegion | None = None
     deadlock_custom_disable_auto_ready: bool = False
-    deadlock_custom_is_publicly_visible: bool = False
+    deadlock_custom_is_publicly_visible: bool = True
     deadlock_custom_min_roster_size: int | None = None
 
     # Deadlock callback settings

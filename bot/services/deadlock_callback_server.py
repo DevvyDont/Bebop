@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import discord
 from aiohttp import web
+from pydantic import ValidationError
 from pymongo import ReturnDocument
 from pymongo.errors import PyMongoError
 
@@ -44,6 +45,10 @@ TEAM_INDEX_HIDDEN_KING = 0
 TEAM_INDEX_ARCHMOTHER = 1
 MAX_SETTINGS_SUMMARY_KEYS = 6
 SETTINGS_ATTACHMENT_FILENAME_TEMPLATE = "match-{match_number}-settings-{timestamp}.json"
+REMAKE_COMMAND_GUIDANCE = (
+    "If party creation breaks or the game fails to start cleanly, use `/remake` to vote for a remake "
+    "during the first 15 minutes."
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +72,15 @@ class ActiveCallbackContext:
     team_a_ids: tuple[int, ...]
     team_b_ids: tuple[int, ...]
     assigned_heroes: tuple[tuple[int, str], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class CallbackTrackingResetSummary:
+    pending_callback_count: int
+    active_callback_count: int
+    deleted_live_match_message_count: int
+    cleared_live_match_post_count: int
+    cleared_match_history_count: int
 
 
 class DeadlockCallbackServer:
@@ -208,6 +222,50 @@ class DeadlockCallbackServer:
                 return
             self._active_by_token.pop(token, None)
 
+    async def retire_party_id(self, party_id: str) -> None:
+        await self.unregister_party_id(party_id)
+        await self._delete_live_match_artifacts_for_party_id(party_id)
+
+    async def reset_tracking_state(self) -> CallbackTrackingResetSummary:
+        live_match_records = await self._get_all_live_match_posts()
+        deleted_live_match_message_count = 0
+        for live_match_record in live_match_records:
+            if await self._delete_live_match_post_message(live_match_record):
+                deleted_live_match_message_count += 1
+
+        cleared_live_match_post_count = 0
+        collection = self._get_live_match_posts_collection()
+        if collection is not None:
+            try:
+                delete_result = await collection.delete_many({})
+                cleared_live_match_post_count = delete_result.deleted_count
+            except PyMongoError:
+                log.exception("Failed to clear persisted live match post records during reset.")
+
+        cleared_match_history_count = 0
+        database = self._bot.database.db
+        if database is not None:
+            try:
+                delete_result = await database[MATCH_HISTORY_COLLECTION_NAME].delete_many({})
+                cleared_match_history_count = delete_result.deleted_count
+            except PyMongoError:
+                log.exception("Failed to clear persisted match history records during reset.")
+
+        async with self._state_lock:
+            pending_callback_count = len(self._pending_by_token)
+            active_callback_count = len(self._active_by_token)
+            self._pending_by_token.clear()
+            self._active_by_token.clear()
+            self._active_token_by_party_id.clear()
+
+        return CallbackTrackingResetSummary(
+            pending_callback_count=pending_callback_count,
+            active_callback_count=active_callback_count,
+            deleted_live_match_message_count=deleted_live_match_message_count,
+            cleared_live_match_post_count=cleared_live_match_post_count,
+            cleared_match_history_count=cleared_match_history_count,
+        )
+
     def _start_live_match_heartbeat(self) -> None:
         if self._live_match_heartbeat_task is not None and not self._live_match_heartbeat_task.done():
             return
@@ -240,14 +298,24 @@ class DeadlockCallbackServer:
         live_match_record: LiveMatchPostRecord,
         heartbeat_timestamp: datetime,
     ) -> None:
+        if not await self._is_live_match_record_still_active(live_match_record):
+            return
+
         try:
-            latest_metadata = await self._bot.deadlock_api.get_match_metadata(live_match_record.match_id)
+            latest_metadata = await self._bot.deadlock_api.get_match_metadata(
+                live_match_record.match_id,
+                is_custom=True,
+            )
         except DeadlockApiRequestError as error:
             log.warning(
-                "Heartbeat metadata refresh failed for match_id=%s (status=%s)",
+                "Heartbeat metadata refresh failed for match_id=%s (status=%s, retry_after=%s)",
                 live_match_record.match_id,
                 error.status_code,
+                error.retry_after_seconds,
             )
+            return
+
+        if not await self._is_live_match_record_still_active(live_match_record):
             return
 
         updated_record = self._apply_match_metadata_to_record(live_match_record, latest_metadata, heartbeat_timestamp)
@@ -263,12 +331,108 @@ class DeadlockCallbackServer:
             return ()
 
         raw_records = await collection.find({"status": LiveMatchPostStatus.IN_PROGRESS.value}).to_list(length=None)
+        return self._parse_live_match_post_records(raw_records)
+
+    async def _get_all_live_match_posts(self) -> tuple[LiveMatchPostRecord, ...]:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return ()
+
+        raw_records = await collection.find({}).to_list(length=None)
+        return self._parse_live_match_post_records(raw_records)
+
+    @staticmethod
+    def _parse_live_match_post_records(raw_records: list[object]) -> tuple[LiveMatchPostRecord, ...]:
         parsed_records: list[LiveMatchPostRecord] = []
         for raw_record in raw_records:
             if not isinstance(raw_record, dict):
                 continue
-            parsed_records.append(LiveMatchPostRecord.model_validate(raw_record))
+
+            try:
+                parsed_records.append(LiveMatchPostRecord.model_validate(raw_record))
+            except ValidationError:
+                log.warning("Skipping invalid live match post record during persistence load.")
         return tuple(parsed_records)
+
+    async def _is_live_match_record_still_active(self, record: LiveMatchPostRecord) -> bool:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return False
+
+        raw_record = await collection.find_one(
+            {
+                "match_id": record.match_id,
+                "party_id": record.party_id,
+                "status": LiveMatchPostStatus.IN_PROGRESS.value,
+            }
+        )
+        return isinstance(raw_record, dict)
+
+    async def _delete_live_match_artifacts_for_party_id(self, party_id: str) -> None:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return
+
+        raw_records = await collection.find({"party_id": party_id}).to_list(length=None)
+        parsed_records = self._parse_live_match_post_records(raw_records)
+
+        if not parsed_records:
+            return
+
+        for record in parsed_records:
+            await self._delete_live_match_post_message(record)
+            await self._delete_live_match_post_record(record.match_id)
+            await self._delete_match_history_record(record.match_id)
+
+    async def _delete_live_match_post_message(self, record: LiveMatchPostRecord) -> bool:
+        if record.message_id is None:
+            return False
+
+        channel = await self._resolve_message_channel(record.matches_channel_id)
+        if channel is None:
+            return False
+
+        try:
+            message = await channel.fetch_message(record.message_id)
+            await message.delete()
+            return True
+        except discord.NotFound:
+            return False
+        except discord.Forbidden:
+            log.warning(
+                "Missing permissions to delete stale live match message %s for party %s",
+                record.message_id,
+                record.party_id,
+            )
+            return False
+        except discord.HTTPException:
+            log.warning(
+                "Failed to delete stale live match message %s for party %s",
+                record.message_id,
+                record.party_id,
+            )
+            return False
+
+    async def _delete_live_match_post_record(self, match_id: int) -> None:
+        collection = self._get_live_match_posts_collection()
+        if collection is None:
+            return
+
+        try:
+            await collection.delete_one({"match_id": match_id})
+        except PyMongoError:
+            log.exception("Failed to delete stale live match post for match_id=%s", match_id)
+
+    async def _delete_match_history_record(self, match_id: int) -> None:
+        database = self._bot.database.db
+        if database is None:
+            return
+
+        collection = database[MATCH_HISTORY_COLLECTION_NAME]
+        try:
+            await collection.delete_one({"match_id": match_id})
+        except PyMongoError:
+            log.exception("Failed to delete stale match history for match_id=%s", match_id)
 
     async def _handle_match_completion_cleanup(self, record: LiveMatchPostRecord) -> None:
         queue_cog = self._bot.get_cog("Queue")
@@ -430,6 +594,7 @@ class DeadlockCallbackServer:
             value=f"`{match_id}`" if match_id is not None else "Unavailable (API lookup failed)",
             inline=False,
         )
+        embed.add_field(name="Need a remake?", value=REMAKE_COMMAND_GUIDANCE, inline=False)
         return embed
 
     @staticmethod
@@ -590,7 +755,11 @@ class DeadlockCallbackServer:
         if not isinstance(raw_record, dict):
             return None
 
-        return LiveMatchPostRecord.model_validate(raw_record)
+        try:
+            return LiveMatchPostRecord.model_validate(raw_record)
+        except ValidationError:
+            log.warning("Skipping invalid live match post record for match_id=%s", match_id)
+            return None
 
     async def _get_live_match_post_by_message(
         self,
@@ -605,7 +774,15 @@ class DeadlockCallbackServer:
         if not isinstance(raw_record, dict):
             return None
 
-        return LiveMatchPostRecord.model_validate(raw_record)
+        try:
+            return LiveMatchPostRecord.model_validate(raw_record)
+        except ValidationError:
+            log.warning(
+                "Skipping invalid live match post record for channel_id=%s message_id=%s",
+                channel_id,
+                message_id,
+            )
+            return None
 
     async def _sync_live_match_post_message(self, record: LiveMatchPostRecord) -> None:
         channel = await self._resolve_message_channel(record.matches_channel_id)
@@ -653,6 +830,10 @@ class DeadlockCallbackServer:
             refresh_started_at,
         )
         if reserved_record is None:
+            if remaining_cooldown <= timedelta(0):
+                await interaction.response.send_message("❌ This live match post is no longer tracked.", ephemeral=True)
+                return
+
             remaining_seconds = max(int(remaining_cooldown.total_seconds()), 1)
             retry_timestamp = refresh_started_at + remaining_cooldown
             await interaction.response.send_message(
@@ -666,7 +847,10 @@ class DeadlockCallbackServer:
             return
 
         try:
-            latest_metadata = await self._bot.deadlock_api.get_match_metadata(reserved_record.match_id)
+            latest_metadata = await self._bot.deadlock_api.get_match_metadata(
+                reserved_record.match_id,
+                is_custom=True,
+            )
         except DeadlockApiRequestError as error:
             await self._restore_refresh_cooldown(
                 live_match_record.match_id,
@@ -676,6 +860,10 @@ class DeadlockCallbackServer:
             message = "❌ Match refresh failed."
             if error.status_code is not None:
                 message = f"❌ Match refresh failed (status {error.status_code})."
+            if error.status_code == 429 and error.retry_after_seconds is not None:
+                message = (
+                    f"❌ Match refresh is currently rate limited. Try again in about {error.retry_after_seconds}s."
+                )
             await interaction.response.send_message(message, ephemeral=True)
             return
 
@@ -727,11 +915,22 @@ class DeadlockCallbackServer:
             return LiveMatchPostRecord.model_validate(raw_record), timedelta(0)
 
         current_record = await self._get_live_match_post_by_match_id(record.match_id)
-        if current_record is None or current_record.last_refresh_at is None:
+        if current_record is None:
+            return None, timedelta(0)
+
+        if current_record.last_refresh_at is None:
             return None, timedelta(seconds=LIVE_MATCH_REFRESH_COOLDOWN_SECONDS)
 
-        retry_at = current_record.last_refresh_at + timedelta(seconds=LIVE_MATCH_REFRESH_COOLDOWN_SECONDS)
-        return None, max(retry_at - requested_at, timedelta(0))
+        last_refresh_at = self._as_utc_aware_datetime(current_record.last_refresh_at)
+        requested_at_utc = self._as_utc_aware_datetime(requested_at)
+        retry_at = last_refresh_at + timedelta(seconds=LIVE_MATCH_REFRESH_COOLDOWN_SECONDS)
+        return None, max(retry_at - requested_at_utc, timedelta(0))
+
+    @staticmethod
+    def _as_utc_aware_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     async def _restore_refresh_cooldown(
         self,
