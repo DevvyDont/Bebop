@@ -39,6 +39,9 @@ class BebopBot(commands.Bot):
             bind_host=settings.deadlock_callback_bind_host,
             bind_port=settings.deadlock_callback_bind_port,
             path_prefix=settings.deadlock_callback_path_prefix,
+            auto_leave_enabled=settings.deadlock_callback_auto_leave_enabled,
+            auto_leave_min_players=settings.deadlock_callback_auto_leave_min_players,
+            auto_leave_retry_cooldown_seconds=settings.deadlock_callback_auto_leave_retry_cooldown_seconds,
         )
 
     async def setup_hook(self) -> None:

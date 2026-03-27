@@ -26,7 +26,7 @@ from bot.models.deadlock import (
 )
 from bot.models.live_match import LiveMatchPostRecord, LiveMatchPostStatus
 from bot.models.match_history import MatchHistoryRecord
-from bot.services.deadlock_api import DeadlockApiRequestError
+from bot.services.deadlock_api import DeadlockApiConfigurationError, DeadlockApiRequestError
 from bot.views.live_match_post import LiveMatchPostView
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,20 @@ TEAM_INDEX_HIDDEN_KING = 0
 TEAM_INDEX_ARCHMOTHER = 1
 MAX_SETTINGS_SUMMARY_KEYS = 6
 SETTINGS_ATTACHMENT_FILENAME_TEMPLATE = "match-{match_number}-settings-{timestamp}.json"
+MIN_AUTO_LEAVE_PLAYER_THRESHOLD = 1
+MIN_AUTO_LEAVE_RETRY_COOLDOWN_SECONDS = 1
+MAX_RECURSIVE_SEARCH_DEPTH = 8
+PLAYER_COUNT_KEYS: tuple[str, ...] = (
+    "player_count",
+    "players_count",
+    "active_player_count",
+    "connected_players",
+    "lobby_player_count",
+    "roster_size",
+    "num_players",
+    "numplayers",
+)
+PLAYER_COLLECTION_KEY_TOKENS: tuple[str, ...] = ("player", "players", "roster", "members", "participants")
 REMAKE_COMMAND_GUIDANCE = (
     "If party creation breaks or the game fails to start cleanly, use `/remake` to vote for a remake "
     "during the first 15 minutes."
@@ -121,6 +135,14 @@ class LiveMatchTrackSummary:
     api_retry_after_seconds: int | None = None
 
 
+@dataclass(slots=True)
+class PartyAutoLeaveState:
+    last_observed_player_count: int | None = None
+    leave_requested: bool = False
+    leave_succeeded: bool = False
+    last_attempt_at: datetime | None = None
+
+
 class DeadlockCallbackServer:
     def __init__(
         self,
@@ -131,6 +153,9 @@ class DeadlockCallbackServer:
         bind_host: str,
         bind_port: int,
         path_prefix: str,
+        auto_leave_enabled: bool,
+        auto_leave_min_players: int,
+        auto_leave_retry_cooldown_seconds: int,
     ) -> None:
         self._bot = bot
         self._enabled = enabled
@@ -138,9 +163,16 @@ class DeadlockCallbackServer:
         self._bind_host = bind_host
         self._bind_port = bind_port
         self._path_prefix = path_prefix.rstrip("/")
+        self._auto_leave_enabled = auto_leave_enabled
+        self._auto_leave_min_players = max(auto_leave_min_players, MIN_AUTO_LEAVE_PLAYER_THRESHOLD)
+        self._auto_leave_retry_cooldown_seconds = max(
+            auto_leave_retry_cooldown_seconds,
+            MIN_AUTO_LEAVE_RETRY_COOLDOWN_SECONDS,
+        )
         self._pending_by_token: dict[str, PendingCallbackContext] = {}
         self._active_by_token: dict[str, ActiveCallbackContext] = {}
         self._active_token_by_party_id: dict[str, str] = {}
+        self._auto_leave_by_party_id: dict[str, PartyAutoLeaveState] = {}
         self._state_lock = asyncio.Lock()
         self._app = web.Application()
         self._runner: web.AppRunner | None = None
@@ -192,6 +224,7 @@ class DeadlockCallbackServer:
             self._pending_by_token.clear()
             self._active_by_token.clear()
             self._active_token_by_party_id.clear()
+            self._auto_leave_by_party_id.clear()
 
     async def prepare_match_callback(
         self,
@@ -248,6 +281,7 @@ class DeadlockCallbackServer:
             )
             self._active_by_token[token] = active_context
             self._active_token_by_party_id[party_id] = token
+            self._auto_leave_by_party_id[party_id] = PartyAutoLeaveState()
 
     async def discard_pending_callback(self, token: str) -> None:
         async with self._state_lock:
@@ -257,8 +291,10 @@ class DeadlockCallbackServer:
         async with self._state_lock:
             token = self._active_token_by_party_id.pop(party_id, None)
             if token is None:
+                self._auto_leave_by_party_id.pop(party_id, None)
                 return
             self._active_by_token.pop(token, None)
+            self._auto_leave_by_party_id.pop(party_id, None)
 
     async def retire_party_id(self, party_id: str) -> None:
         await self.unregister_party_id(party_id)
@@ -295,6 +331,7 @@ class DeadlockCallbackServer:
             self._pending_by_token.clear()
             self._active_by_token.clear()
             self._active_token_by_party_id.clear()
+            self._auto_leave_by_party_id.clear()
 
         return CallbackTrackingResetSummary(
             pending_callback_count=pending_callback_count,
@@ -407,6 +444,8 @@ class DeadlockCallbackServer:
 
         try:
             metadata = await self._bot.deadlock_api.get_match_metadata(match_id, is_custom=True)
+        except DeadlockApiConfigurationError:
+            return LiveMatchTrackSummary(status=LiveMatchTrackStatus.API_VALIDATION_FAILED, match_id=match_id)
         except DeadlockApiRequestError as error:
             return LiveMatchTrackSummary(
                 status=LiveMatchTrackStatus.API_VALIDATION_FAILED,
@@ -670,7 +709,8 @@ class DeadlockCallbackServer:
             return web.Response(status=401, text="Unauthorized")
 
         raw_body = await request.read()
-        self._parse_settings_payload(raw_body)
+        settings_payload = self._parse_settings_payload(raw_body)
+        await self._maybe_auto_leave_custom_lobby(context, settings_payload, raw_body)
 
         settings_payload_text = raw_body.decode("utf-8", errors="replace")
         compact_summary = self._build_settings_update_summary(settings_payload_text)
@@ -687,6 +727,147 @@ class DeadlockCallbackServer:
             attachment=attachment,
         )
         return web.Response(status=200, text="ok")
+
+    async def _maybe_auto_leave_custom_lobby(
+        self,
+        context: ActiveCallbackContext,
+        settings_payload: DeadlockSettingsUpdatedCallback,
+        raw_payload: bytes,
+    ) -> None:
+        if not self._auto_leave_enabled:
+            return
+
+        observed_player_count = self._resolve_active_player_count(settings_payload, raw_payload)
+        if observed_player_count is None:
+            return
+
+        now = datetime.now(UTC)
+        async with self._state_lock:
+            auto_leave_state = self._auto_leave_by_party_id.get(context.party_id)
+            if auto_leave_state is None:
+                auto_leave_state = PartyAutoLeaveState()
+                self._auto_leave_by_party_id[context.party_id] = auto_leave_state
+
+            previous_player_count = auto_leave_state.last_observed_player_count
+            auto_leave_state.last_observed_player_count = observed_player_count
+
+            if auto_leave_state.leave_succeeded:
+                return
+
+            if auto_leave_state.leave_requested:
+                return
+
+            if observed_player_count < self._auto_leave_min_players:
+                return
+
+            crossed_threshold = previous_player_count is None or previous_player_count < self._auto_leave_min_players
+            if not crossed_threshold:
+                return
+
+            if auto_leave_state.last_attempt_at is not None:
+                retry_at = auto_leave_state.last_attempt_at + timedelta(
+                    seconds=self._auto_leave_retry_cooldown_seconds
+                )
+                if now < retry_at:
+                    return
+
+            auto_leave_state.leave_requested = True
+            auto_leave_state.last_attempt_at = now
+
+        try:
+            await self._bot.deadlock_api.leave_custom_match(context.party_id)
+        except DeadlockApiConfigurationError:
+            async with self._state_lock:
+                auto_leave_state = self._auto_leave_by_party_id.get(context.party_id)
+                if auto_leave_state is not None:
+                    auto_leave_state.leave_requested = False
+                    auto_leave_state.last_attempt_at = datetime.now(UTC)
+
+            log.warning("Auto-leave is enabled but DEADLOCK_API_KEY is not configured.")
+            return
+        except DeadlockApiRequestError as error:
+            async with self._state_lock:
+                auto_leave_state = self._auto_leave_by_party_id.get(context.party_id)
+                if auto_leave_state is not None:
+                    auto_leave_state.leave_requested = False
+                    auto_leave_state.last_attempt_at = datetime.now(UTC)
+
+            log.warning(
+                "Auto-leave failed for party_id=%s at player_count=%s (status=%s, body=%s)",
+                context.party_id,
+                observed_player_count,
+                error.status_code,
+                error.response_body,
+            )
+            return
+
+        async with self._state_lock:
+            auto_leave_state = self._auto_leave_by_party_id.get(context.party_id)
+            if auto_leave_state is not None:
+                auto_leave_state.leave_requested = False
+                auto_leave_state.leave_succeeded = True
+
+        log.info(
+            "Auto-left custom lobby for party_id=%s after settings callback reported %s player(s).",
+            context.party_id,
+            observed_player_count,
+        )
+
+    def _resolve_active_player_count(
+        self,
+        settings_payload: DeadlockSettingsUpdatedCallback,
+        raw_payload: bytes,
+    ) -> int | None:
+        top_level_count = settings_payload.resolved_top_level_player_count()
+        if top_level_count is not None:
+            return top_level_count
+
+        payload_text = raw_payload.decode("utf-8", errors="replace")
+        if not payload_text.strip():
+            return None
+
+        try:
+            parsed_payload = json.loads(payload_text)
+        except json.JSONDecodeError:
+            return None
+
+        recursive_count = self._extract_player_count_from_json(parsed_payload, depth=0)
+        if recursive_count is None or recursive_count < 0:
+            return None
+        return recursive_count
+
+    def _extract_player_count_from_json(self, payload_node: object, depth: int) -> int | None:
+        if depth > MAX_RECURSIVE_SEARCH_DEPTH:
+            return None
+
+        if isinstance(payload_node, int) and payload_node >= 0:
+            return None
+
+        candidates: list[int] = []
+        if isinstance(payload_node, dict):
+            for key, value in payload_node.items():
+                normalized_key = key.casefold().replace("-", "_").replace(" ", "_")
+                if normalized_key in PLAYER_COUNT_KEYS and isinstance(value, int) and value >= 0:
+                    candidates.append(value)
+
+                if isinstance(value, list | tuple):
+                    key_looks_like_players = any(token in normalized_key for token in PLAYER_COLLECTION_KEY_TOKENS)
+                    if key_looks_like_players:
+                        candidates.append(len(value))
+
+                nested_count = self._extract_player_count_from_json(value, depth + 1)
+                if nested_count is not None:
+                    candidates.append(nested_count)
+
+        elif isinstance(payload_node, list | tuple):
+            for list_item in payload_node:
+                nested_count = self._extract_player_count_from_json(list_item, depth + 1)
+                if nested_count is not None:
+                    candidates.append(nested_count)
+
+        if not candidates:
+            return None
+        return max(candidates)
 
     @staticmethod
     def _build_settings_update_summary(settings_payload_text: str) -> str:

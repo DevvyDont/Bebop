@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     deadlock_callback_bind_host: str = "0.0.0.0"
     deadlock_callback_bind_port: int = 8080
     deadlock_callback_path_prefix: str = "/callbacks/deadlock"
+    deadlock_callback_auto_leave_enabled: bool = True
+    deadlock_callback_auto_leave_min_players: int = 12
+    deadlock_callback_auto_leave_retry_cooldown_seconds: int = 30
 
 
 settings = Settings()

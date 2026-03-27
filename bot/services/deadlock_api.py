@@ -23,6 +23,7 @@ CUSTOM_MATCH_CREATE_PATH = "/v1/matches/custom/create"
 CUSTOM_MATCH_ID_PATH_TEMPLATE = "/v1/matches/custom/{party_id}/match-id"
 CUSTOM_MATCH_LEAVE_PATH_TEMPLATE = "/v1/matches/custom/{party_id}/leave"
 MATCH_METADATA_PATH_TEMPLATE = "/v1/matches/{match_id}/metadata"
+CUSTOM_MATCH_LEAVE_IDEMPOTENT_STATUS_CODES: tuple[int, ...] = (404, 409, 410)
 
 
 class DeadlockApiError(Exception):
@@ -134,6 +135,14 @@ class DeadlockApiClient:
         try:
             async with session.post(request_url, headers=request_headers) as response:
                 response_text = await response.text()
+                if response.status in CUSTOM_MATCH_LEAVE_IDEMPOTENT_STATUS_CODES:
+                    log.info(
+                        "Treating custom lobby leave as no-op for party_id=%s (status=%s)",
+                        party_id,
+                        response.status,
+                    )
+                    return
+
                 if response.status < 200 or response.status >= 300:
                     raise DeadlockApiRequestError(
                         message="Deadlock custom lobby leave request failed.",

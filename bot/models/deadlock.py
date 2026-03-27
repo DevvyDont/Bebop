@@ -114,4 +114,23 @@ class DeadlockMatchStartedCallback(BaseModel):
 
 
 class DeadlockSettingsUpdatedCallback(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="allow", populate_by_name=True)
+
+    player_count: int | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "player_count",
+            "players_count",
+            "active_player_count",
+            "connected_players",
+            "lobby_player_count",
+            "roster_size",
+            "num_players",
+            "numPlayers",
+        ),
+    )
+
+    def resolved_top_level_player_count(self) -> int | None:
+        if self.player_count is None or self.player_count < 0:
+            return None
+        return self.player_count
