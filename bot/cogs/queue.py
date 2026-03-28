@@ -330,6 +330,17 @@ def _is_admin(member: discord.Member) -> bool:
     return member.guild_permissions.manage_guild
 
 
+def _resolve_admin_role(guild: discord.Guild) -> discord.Role | None:
+    if settings.admin_role_name is None:
+        return None
+
+    target_role_name = settings.admin_role_name.casefold()
+    for role in guild.roles:
+        if role.name.casefold() == target_role_name:
+            return role
+    return None
+
+
 async def _admin_check(interaction: discord.Interaction) -> bool:
     if not isinstance(interaction.user, discord.Member):
         raise app_commands.CheckFailure("This command can only be used inside a server.")
@@ -1195,6 +1206,15 @@ class QueueCog(commands.Cog, name="Queue"):
         text_overwrites: dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=False),
         }
+
+        admin_role = _resolve_admin_role(guild)
+        if admin_role is not None:
+            text_overwrites[admin_role] = discord.PermissionOverwrite(
+                view_channel=True,
+                send_messages=True,
+                read_message_history=True,
+            )
+
         if guild.me is not None:
             text_overwrites[guild.me] = discord.PermissionOverwrite(view_channel=True, send_messages=True)
 
@@ -1247,6 +1267,17 @@ class QueueCog(commands.Cog, name="Queue"):
         team_b_overwrites: dict[discord.Role | discord.Member | discord.Object, discord.PermissionOverwrite] = {
             guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False),
         }
+
+        admin_role = _resolve_admin_role(guild)
+        if admin_role is not None:
+            admin_voice_permissions = discord.PermissionOverwrite(
+                view_channel=True,
+                connect=True,
+                speak=True,
+                stream=True,
+            )
+            team_a_overwrites[admin_role] = admin_voice_permissions
+            team_b_overwrites[admin_role] = admin_voice_permissions
 
         if guild.me is not None:
             bot_permissions = discord.PermissionOverwrite(view_channel=True, connect=True)

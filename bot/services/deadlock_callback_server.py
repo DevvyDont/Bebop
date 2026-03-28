@@ -48,6 +48,7 @@ MAX_SETTINGS_SUMMARY_KEYS = 6
 SETTINGS_ATTACHMENT_FILENAME_TEMPLATE = "match-{match_number}-settings-{timestamp}.json"
 MIN_AUTO_LEAVE_PLAYER_THRESHOLD = 1
 MIN_AUTO_LEAVE_RETRY_COOLDOWN_SECONDS = 1
+AUTO_LEAVE_GRACE_DELAY_SECONDS = 5
 MAX_RECURSIVE_SEARCH_DEPTH = 8
 PLAYER_COUNT_KEYS: tuple[str, ...] = (
     "player_count",
@@ -773,6 +774,14 @@ class DeadlockCallbackServer:
 
             auto_leave_state.leave_requested = True
             auto_leave_state.last_attempt_at = now
+
+        # Give the lobby a brief grace period before removing the spectator bot.
+        await asyncio.sleep(AUTO_LEAVE_GRACE_DELAY_SECONDS)
+
+        async with self._state_lock:
+            auto_leave_state = self._auto_leave_by_party_id.get(context.party_id)
+            if auto_leave_state is None or not auto_leave_state.leave_requested or auto_leave_state.leave_succeeded:
+                return
 
         try:
             await self._bot.deadlock_api.leave_custom_match(context.party_id)
